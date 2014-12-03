@@ -1,0 +1,4 @@
+!noci
+data/System/QgularContrib.txt 0644 Contrib doc page
+lib/Foswiki/Plugins/QgularContrib.pm 0644 Contrib Perl module
+pub/System/QgularContrib/qgular.uncompressed.js JavaScript part
