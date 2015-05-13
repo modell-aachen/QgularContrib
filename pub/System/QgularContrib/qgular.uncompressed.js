@@ -1,21 +1,109 @@
 ;(function ($, _, document, window, undefined) {
   'use strict';
 
-  /* qbind: one-way bind system resistant against code injection
+  /* Qgular: the non-MVC framework with its own acronym!
+   *
+   * Qgular implements the DTW (Data-Transform-Widget) paradigm.
+   * There's that acronym we promised.
    *
    * Core tenets:
-   * (1) For customization, having to put HTML snippet template inside
-   *     JavaScript code is infeasible, ruling out Underscore's template
-   *     system
+   * (1) For combining data and markup, having to put HTML snippet template
+   *     inside JavaScript code is infeasible if customizing the markup should
+   *     be easily possible, ruling out Underscore's template system
    *
-   * (2) Having to bind event handlers and the like inside the HTML is dirty
-   *     and violates separation of concerns. Frameworks like Angular don't
-   *     easily support binding events from within scripts, and make it hard
-   *     to access the model from vanilla JS events.
+   * (2) Having to bind event handlers and the like inside the HTML is dirty,
+   *     violates separation of concerns and is likely to create XSS issues.
+   *     Existing MV* frameworks don't easily support binding events from
+   *     within scripts, and make it hard to access the model from vanilla JS
+   *     events.
    *
-   * (3) Two-way binding helps with a very small class of use cases and does
-   *     not provide any notable benefits for more transaction-oriented user
-   *     interfaces, but adds significant complexity to the code.
+   * (3) Two-way binding, which is all the rage these days, helps with a very
+   *     small class of use cases and does not provide any notable benefits
+   *     for more transaction-oriented user interfaces, but adds significant
+   *     complexity to the code.
+   *
+   *
+   * The DTW paradigm:
+   *
+   * Data: an unopinionated, JSON-centric, observable data model; see QData
+   * below.
+   *
+   * Widget: encapsulated pieces of logic that are anchored to a specific node
+   * in a nested structure of QDataNode elements, responsible for rendering
+   * its subtree of QDataNodes and potentially submitting changes made by the
+   * user back to that structure.
+   *
+   * Transform: each layer/widget can have its own transformed representation
+   * of the data. Changes made in one layer (e.g. edits by user) can be kept
+   * separate from changes made in another layer (e.g. updates from the
+   * server). This is useful to implement transaction logic, among other
+   * things.
+   *
+   * Support for each element of DTW is designed such that simple use cases
+   * require little code and the code is easily extended as the complexity of
+   * the scenario increases.
+   */
+
+  // Support functions: pathspecs {{{
+  var pathToChain = function(o, p) {
+    var chain = [o];
+    var last = o;
+    $.each(p, function() {
+      if (typeof last[this] !== 'undefined') {
+        var next = last[this];
+        chain.push(next);
+        last = next;
+      } else {
+        last = undefined;
+        return false;
+      }
+    });
+    if (last === undefined) { return undefined; }
+    return chain;
+  };
+
+  var pathToVal = function(o, p) {
+    var chain = pathToChain(o, p);
+    if (chain === undefined) { return undefined; }
+    return chain.pop();
+  };
+
+  var mkpath = function(ref) {
+    if (typeof ref === 'string') {
+      return ref.split('.');
+    }
+    return ref;
+  };
+
+  var refToVal = function(o, ref) {
+    if (o instanceof QWidget) {
+      return o.get(ref);
+    }
+    return pathToVal(o, mkpath(ref));
+  };
+  // }}}
+  // Support function: Object.create polyfill {{{
+  // Source: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/create
+  if (typeof Object.create !== 'function') {
+    Object.create = (function() {
+      var Temp = function() {};
+      return function(prototype) {
+        if (arguments.length > 1) {
+          throw Error('Second argument not supported');
+        }
+        if (typeof prototype !== 'object') {
+          throw Error('Argument must be an object');
+        }
+        Temp.prototype = prototype;
+        var result = new Temp();
+        Temp.prototype = null;
+        return result;
+      };
+    })();
+  }
+  // }}}
+
+  /* qbind: one-way bind system resistant against code injection {{{
    *
    * Our minimalistic approach: bindings are applied by calling a jQuery
    * function on the top-level element. The function collects binding
@@ -34,6 +122,9 @@
    * The first time qbind is applied, the qbind attributes are removed from
    * the DOM, but future calls to qbind will still work.
    *
+   * qbind NEVER inserts HTML; it will only insert attributes (except those
+   * that can be used to inject script) and text nodes.
+   *
    * Usage example:
    * (HTML)
    * <div id="foo" qbind=".title // title, data-url: url">
@@ -50,12 +141,37 @@
    *   <div class="title">My title</div>
    *   <div>The quick brown fox jumps over the lazy dog</div>
    * </div>
+   *
+   * (There is no specific reason for binding title in a different way than
+   * content in the HTML example, other than for demonstrating both ways. Pick
+   * whatever works best for you.)
    */
-  $.fn.qbind = function(data, mapper, attr) {
+  $.fn.qbind = function(data, attr) {
     if (!attr) { attr = 'qbind'; }
     this.each(function() {
       var $e = $(this);
       var binds = $.data(this, 'qbind');
+
+      // Plumbing
+      if (data === 'get') { return binds; }
+
+      // Allow code to create the bindings instead of grabbing from DOM
+      if (data === 'define') {
+        binds = [];
+        $.each(attr, function() {
+          var elem = this.element;
+          // Allows passing: jQuery object, empty selector to select qbind
+          // root node; other selector to select descendant
+          if (!(elem instanceof jQuery)) {
+            if (elem === '') { elem = $e; }
+            elem = $e.find(elem);
+          }
+          binds.push($.extend({}, this, {element: elem}));
+
+        });
+        $.data(this, 'qbind', binds);
+        return;
+      }
 
       // Collect bindspecs
       if (!binds) {
@@ -97,29 +213,20 @@
 
       // Apply bindings
       $.each(binds, function() {
-        var slotpath = this.slot.split(/\./);
-        var v = data;
-        while (slotpath.length) {
-          v = v[slotpath.shift()];
-          if (v === null || v === undefined) { break; }
-        }
-        if (mapper[this.slot]) {
-          v = mapper[this.slot](v);
-        }
+        var v = refToVal(data, this.slot);
         if (v === null || v === undefined) { v = ''; }
-        if (v instanceof QWidget) {
-          this.element.empty().append(v.$e);
-        }
         if (this.attr === '_text') {
           this.element.text(v);
         } else {
-          this.element.attr(this.attr, v);
+          this.element.attr((this.pre ? this.pre : '') + this.attr +
+            (this.post ? this.post : ''), v);
         }
       });
     });
   };
+  // }}}
 
-  /* qtemplate: template engine based on qbind
+  /* qtemplate: template engine based on qbind {{{
    *
    * * Templates are defined inline, in the place where they will be used
    *   later. A mechanism to reuse a template in multiple places in the DOM
@@ -196,7 +303,7 @@
         if ($tmpl.find('[qt-bind]').addBack('[qt-bind]').length) {
           attr = 'qt-bind';
         }
-        $tmpl.qbind(options, {}, attr);
+        $tmpl.qbind(options, attr);
         self.append($tmpl);
         return $tmpl;
       }
@@ -206,87 +313,418 @@
   $(function() {
     $('[data-qtemplate]').qtemplate('compile');
   });
+  // }}}
 
-  // TODO: two-stage!
-  // 1) function to create a subclass containing the template DOM node
-  // 2) subclass should do the actual lifting
-  // also: assign event handlers in stage 1
-  window.QWidget = function(o) {
-    var self = this;
-    if (o.detach !== false) {
-      o.$e.detach();
-    }
-    this.$e = o.$e;
-    this.children = [];
-    this.childrenKeys = {};
-    this.id = o.id;
-    this.data = o.data || {};
-
-    // Container for children
-    if (o.container) { this.$c = $(o); }
-
-    this.get = function(k) {
-      return this.data[k];
-    };
-    this.set = function(data) {
-      $.each(data, function(k,v) {
-        self.data[k] = v;
+  /* qpubsub: signals/slots {{{
+   *
+   * A mixin for other Q* objects to provide pub/sub mechanics.
+   */
+  function QPubSub() {
+    this._subscribers = {};
+  }
+  $.extend(QPubSub.prototype, {
+    on: function(type, cb) {
+      if (!this._subscribers[type]) this._subscribers[type] = [];
+      this._subscribers[type].push(cb);
+      return this;
+    },
+    off: function(type, cb) {
+      this._subscribers[type] = this._subscribers[type].filter(function(v) {
+        return v !== cb;
       });
-      this.$e.qbind(self.data);
-    };
+    },
+    _notify: function(type) {
+      var self = this;
+      var args = arguments.slice(1);
+      $.each(this._subscribers[type], function(_idx, sub) {
+        sub(self, args);
+      });
+    }
+  });
+  // }}} 
 
-    this.vanish = function() {
-      if (this.parent) {
-        this.parent.remove(this);
-      } else {
-        this.$e.remove();
+  /* qdata: schemaless data model {{{
+   *
+   * Provides a simple, JSON-centric data model with a minimalistic interface.
+   * This consists of objects wrapping around JSON data, and collections for
+   * handing multiple sets of data to a component.
+   *
+   * In addition, all of these objects allow subscribing to data manipulation
+   * events ('change' for a JSON wrapper, and additionally 'add' and 'remove'
+   * for collections), so that changes in the data can be responded to, e.g.
+   * by rendering them in a widget.
+   *
+   * Usage example:
+   *   var par = new QData({
+   *     id: 13,
+   *     title: "Parsnip",
+   *     amount: 2,
+   *     unit: "pcs"
+   *   });
+   *   var oni = new QData({
+   *     id: 4,
+   *     title: "Onion",
+   *     amount: 3,
+   *     unit: "pcs",
+   *     remark: "Steam viciously"
+   *   });
+   *   var ingredients = new QDataList([par, oni]);
+   *   ingredients.on('add', function(_container, i) {
+   *     Cooking.Pot.insert(i.data());
+   *   });
+   *   ingredients.on('change', function(_container, i) {
+   *     Cooking.Chef.notify('change_ingredient', i.data());
+   *   });
+   *   ingredients.add(new QData({
+   *     (...)
+   *   });
+   *   oni.set({amount: 4, remark: QDeleteThis()});
+   *
+   */
+  function QDataNode() {
+    QPubSub.call(this);
+    this._parents = [];
+  }
+  $.extend(QDataNode.prototype, {
+    _addParent: function(obj) {
+      this._parents.push(obj);
+    },
+    _removeParent: function(obj) {
+      this._parents = this._parents.filter(function(v) { return v !== obj; });
+    },
+    _changed: function(old) {
+      var self = this;
+      $.each(this._parents, function(_idx, p) {
+        p._childChanged(self, old);
+      });
+    }
+  });
+  $.extend(QDataNode, {
+    make: function(data) {
+      if (data instanceof QDataNode) { return data; }
+      if (data instanceof Array) { return new QDataList(list); }
+      return new QData(data);
+    },
+  });
+  QDataNode.prototype = Object.create(QPubSub);
+
+  function QDeleteThis() {
+    if (this === window) {
+      return new QDeleteThis();
+    }
+  }
+  function QData(data) {
+    QDataNode.call(this);
+    this._data = data;
+  }
+  QData.prototype = $.extend(Object.create(QDataNode), {
+    set: function(data) {
+      var self = this;
+      var old = this._data;
+      this._data = $.extend({}, this._data);
+      var apply = function(o, d) {
+        $.each(d, function(k, v) {
+          if (v instanceof QDeleteThis) {
+            delete o[k];
+          } else if (typeof v !== 'object') {
+            o[k] = v;
+          } else {
+            o[k] = $.extend({}, o[k]);
+            apply(o[k], v);
+          }
+        });
+      };
+      apply(this._data, data);
+      this._notify('change', old);
+      this._changed(old);
+      return this;
+    },
+    data: function() {
+      return this._data;
+    }
+  });
+
+  function QDataList(list) {
+    QDataNode.call(this);
+    var self = this;
+    this._data = list || [];
+    $.each(this._data, function(_idx, v) {
+      v._addParent(self);
+    });
+  }
+  QDataList.prototype = $.extend(Object.create(QDataNode), {
+    add: function(elem) {
+      this._data.push(elem);
+      elem._addParent(this);
+      this._notify('add', elem);
+      return this;
+    },
+    remove: function(elem) {
+      var prevLength = this._data.length;
+      this._data = this._data.filter(function(v) { return v !== elem; });
+      if (this._data.length == prevLength) {
+        throw new Error("Attempted to remove QDataObject from a collection it wasn't a member of");
       }
-    };
+      elem._removeParent(this);
+      this._notify('remove', elem);
+      return this;
+    },
+    get: function(idx) {
+      return this._data[idx];
+    },
+    _childChanged: function(child, old, source) {
+      if (!source) source = 'data';
+      this._notify('change.'+source, child, old);
+    }
+  });
 
-    // Sub-collection functions
-
-    this.add = function(data, pos) {
-      if (data.parent && data.parent !== this) {
-        throw "Tried to add a QWidget to a second parent; not possible";
+  function QDataDict(data) {
+    QDataList.call(this, data || {});
+  }
+  QDataDict.prototype = $.extend(Object.create(QDataList), {
+    add: function(key, elem) {
+      if (typeof this._data[key] !== 'undefined') {
+        if (this._data[key] === elem) {
+          // For now it seems expedient to just ignore this case
+          return;
+        }
+        throw new Error("Attempted to add new key to QDataDict that already existed");
       }
-      if (data.id && this.childrenKeys[data.id]) {
-        // Simply ignore dupes
+      this._data[key] = elem;
+      elem._addParent(this);
+      this._notify('add', elem);
+      return this;
+    },
+    removeKey: function(key) {
+      if (typeof this._data[key] === 'undefined') {
+        throw new Error("Attempted to remove key from QDataDict that didn't actually exist");
+      }
+      var elem = this._data[key];
+      delete this._data[key];
+      elem._removeParent(this);
+      this._notify('remove', elem);
+      return this;
+    },
+    _childChanged: function(child, old) {
+      this._notify('change', child, old);
+    }
+  });
+  // }}}
+
+  /*
+   * qtransformer: create a clone of a qdata object, providing customizable,
+   * bidirectional propagation of changes.
+   *
+   * Suppose you have data from your server that describes a set of products.
+   * You want to render them using a generic picture-plus-title widget which
+   * expects a different data format than the one your product records use.
+   *
+   * You can solve this by creating a QTransformer that transforms each
+   * product record into a format supported by the widget. The transform will
+   * automatically update whenever the product record changes.
+   *
+   * Transforms can have arbitrary complexity. You could create a transformed
+   * copy of a product record that doesn't actually transform anything, then
+   * feed the copy into a product editor widget. The transform from original
+   * to editor's copy could, on updates to the original record, merge the
+   * updates into the editor in a way suitable for the application, possibly
+   * presenting the user with conflict resolution options. Finally, when the
+   * editor has been dismissed and the database updated, the transform back to
+   * the original could simply copy the editor's data.
+   */
+  function QTransformer(opts) {
+    QDataNode.call(this);
+    var self = this;
+    this._data = {};
+    this._base = opts.base;
+    this._morph = opts.morph;
+    this._unmorph = opts.unmorph;
+    this._base.on('change', function(_self, old) {
+      self.morph();
+    });
+    this._data.on('change', function(_self, old) {
+      self.unmorph();
+    });
+  }
+  $.extend(QTransformer.prototype, Object.create(QDataNode), {
+    _morphLevel: function(data, xform) {
+      
+    },
+    morph: function() {
+      
+    },
+    _unmorphLevel: function(data, xform) {
+      
+    },
+    unmorph: function() {
+      
+    }
+  });
+
+  /*
+   * qwidget: automatically apply qdata changes to DOM
+   *
+   * An instance of QWidget has a QData object and a DOM element associated
+   * with it and automatically re-renders the DOM element whenever the QData
+   * changes.
+   *
+   * The instance additionally binds any DOM event handlers needed for
+   * user interaction.
+   */
+  function QWidget(opts) {
+    QPubSub.call(this);
+
+    var self = this;
+    this._data = opts.data;
+    this._dirty = false;
+
+    var $tmpl = $(opts.template);
+    this.$e = $tmpl.clone();
+    this.render();
+
+    this._changeHandler = function(_d, old) {
+      if (self.isDirty()) {
+        // TODO pass to conflict resolution
+      }
+      self.render();
+    };
+    data.on('change', this._changeHandler);
+  }
+  $.extend(QWidget.prototype, Object.create(QPubSub), {
+    isDirty: function() {
+      return this._dirty;
+    },
+    render: function() {
+      this.$e.qbind(this);
+      return this;
+    },
+    element: function() {
+      return this.$e;
+    },
+    detach: function() {
+      this.off('change', this._changeHandler);
+    },
+    remove: function() {
+      this.detach();
+      this.$e.remove();
+    }
+  });
+
+  function QWidgetGroup(opts) {
+    QPubSub.call(this);
+    var self = this;
+    this.$c = $(opts.container);
+    this._data = opts.data;
+    this._childrenMap = {};
+    this._children = [];
+    this._idField = opts.idField || 'id';
+
+    if (opts.generate) {
+      this._generate = opts.generate;
+    } else {
+      this._generate = function() {
+        return {
+          type: opts.type,
+          template: opts.template
+        };
+      };
+      this._type = opts.type;
+      var $tmpl = $(opts.template);
+      if (!$tmpl || $tmpl.length === 0) {
+        throw new Error("Couldn't find widget template for QWidgetFactory");
+      }
+      this.$tmpl = $tmpl;
+    }
+    if (opts.comparator) {
+      this._comparator = opts.comparator;
+    } else {
+      this._comparator = function(a, b) {
+        return a[this._idField].localeCompare(b[this._idField]);
+      };
+    }
+
+    this._addHandler = function(_d, newChild) {
+      var gen = self._generate(newChild);
+      var type = gen.type;
+      delete gen.type;
+      gen.data = _d;
+      /* jshint newcap: false */
+      var qw = new type(gen);
+      /* jshint newcap: true */
+      self._childrenMap[newChild[self._idField]] = qw;
+      var idx = this._insertWidget(qw);
+      self._insertElem(qw.element(), idx);
+    };
+    this._data.on('add', this._addHandler);
+    this._removeHandler = function(_d, chld) {
+      var qw = self._children[chld[self._idField]];
+      if (!qw) {
+        throw new Error("Tried to remove non-existent widget from QWidgetFactory");
+      }
+      qw.remove();
+      delete self._children[chld[self._idField]];
+      self._removeWidget(qw);
+    };
+    this._data.on('remove', this._removeHandler);
+  }
+  $.extend(QWidgetFactory.prototype, Object.create(QPubSub), {
+    detach: function() {
+      this.off('add', this._addHandler);
+      this.off('remove', this._removeHandler);
+    },
+    remove: function() {
+      this.$c.remove();
+    },
+    resort: function() {
+      var list = this._children;
+      this._children = [];
+      this.$c.children().detach();
+      $.each(list, function(_idx, v) {
+        var idx = this._insertWidget(v);
+        this._insertElem(qw.element(), idx);
+      });
+    },
+    comparator: function(cmp) {
+      if (!cmp) { return this._comparator; }
+      if (this._comparator === cmp) { return; }
+      this._comparator = cmp;
+      this.resort();
+    },
+    _insertWidget: function(qw, l, r) {
+      if (typeof l === 'undefined') {
+        l = -1;
+        r = this._children.length;
+      }
+      if (r-l === 1) {
+        if (r === 0 || r === this._children.length) {
+          this._children.push(qw);
+          return 0;
+        }
+        this._children.splice(r, 0, qw);
+        return r;
+      }
+      // Binary search
+      var pivot = Math.round((l+r)/2); // r-l >= 2, therefore int(pivot) is between l and r
+      var cmp = this._comparator(qw, this._children[pivot]);
+      if (cmp === 0) {
+        this._children.splice(pivot, 0, qw);
+        return pivot;
+      }
+      if (cmp < 0) {
+        return this._insertWidget(qw, l, pivot);
+      }
+      return this._insertWidget(qw, pivot, r);
+    },
+    _insertElem: function(elem, idx) {
+      if (this.$c.length === idx) {
+        this.$c.append(elem);
         return;
       }
-      data.parent = this;
-      if (data.id) { this.childrenKeys[data.id] = data; }
-      if (!pos) { pos = this.children.length; }
-      if (pos < 0) { pos = this.children.length + (pos-1); } // -1 = after last elem, -2 = before last elem, ...
-      if (pos === this.children.length) {
-        this.$c.append(data.$e);
-      } else {
-        this.$c.eq(pos).before(data.$e);
-      }
-      this.children.splice(pos, 0, data);
-
-    };
-    this.remove = function(idx) {
-      var d = idx;
-      if (typeof idx === 'object') {
-        this.children.splice(this.children.indexOf(d), 1);
-      } else {
-        d = this.children.splice(idx, 1);
-        d = d[0];
-      }
-      if (d.id) { delete this.childrenKeys[d.id]; }
-      d.remove();
-    };
-    this.removeById = function(id) {
-      var d = this.childrenKeys[id];
-      if (!d) { return; }
-      var idx = this.children.indexOf(d);
-      this.children.splice(idx, 1);
-      delete this.childrenKeys[d.id];
-    };
-
-    if (o.parent) {
-      o.parent.add(this);
+      elem.insertBefore(this.$c.children().eq(idx));
+    },
+    _removeWidget: function(qw) {
+      this._children = this._children.filter(function(e) { return e !== qw; });
     }
-    this.set({});
-  };
+  });
+
 }(jQuery, window._, window.document, window));
